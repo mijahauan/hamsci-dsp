@@ -10,4 +10,4 @@ Modules:
             hf-timestd's /run/hf-timestd/authority.json (RTP↔UTC offset).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
