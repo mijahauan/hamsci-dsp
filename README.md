@@ -16,18 +16,39 @@ hamsci-dsp = { path = "../hamsci-dsp", editable = true }
 
 ## Modules
 
-| Module | What it provides |
-|--------|------------------|
-| `hamsci_dsp.timing` | `AuthorityReader` / `AuthoritySnapshot` — the consumer side of hf-timestd's `/run/hf-timestd/authority.json` (the RTP↔UTC offset + tier). Stdlib-only. |
+| Module | What it provides | Deps |
+|--------|------------------|------|
+| `hamsci_dsp.timing` | `AuthorityReader` / `AuthoritySnapshot` — RTP↔UTC offset + tier from hf-timestd's `authority.json`. | stdlib |
+| `hamsci_dsp.constants` | `C_M_S`, `K_TEC=40.3`, `R_EARTH_KM`, `TECU`. | stdlib |
+| `hamsci_dsp.geometry` | great-circle distance / bearing / midpoint / destination (geographiclib), reflection geometry (elevation, hop path), Maidenhead grid ↔ lat/lon. | numpy, geographiclib |
+| `hamsci_dsp.dsp` | canonical peak SNR (Rayleigh/​signed), robust noise floor, `CoherentStack` (slow-time range-Doppler), carrier→Doppler, FFT correlation. | numpy |
+| `hamsci_dsp.propagation` | **path observables**: `carrier` (phase→dTEC, dTEC/dt), `oblique` (virtual height, equivalent vertical freq, MUF, obliquity), `scintillation` (S4, σφ — ITU-R P.531). | numpy |
+| `hamsci_dsp.ionosphere` | solar position/zenith (dep-free) + `ionosphere_state` (IRI when available, parametric fallback). | numpy; `iono` extra → `iri2020` |
+| `hamsci_dsp.raytrace` | `RaytraceEngine` — lazy PyLAP/PHaRLAP wrapper (advisory; no-op when absent). | `raytrace` extra → `pylap` (+ PHaRLAP) |
 
-The `timing` module is the canonical extraction of the reader that hf-tec,
-codar-sounder, psk-recorder, and wspr-recorder each duplicated; the
-`authority.json` schema-v1 contract itself is owned by
-`hf-timestd/docs/METROLOGY.md §4.5.2`.
+`timing`, `constants`, `geometry`, `dsp`, and `propagation` are extracted
+math-identical from the clients (the `authority.json` schema is owned by
+`hf-timestd/docs/METROLOGY.md §4.5.2`; the carrier-dTEC and oblique-inversion
+physics from hf-timestd `carrier_tec.py`/`tec_geometry.py` and codar
+`invert.py`/`scintillation.py`). `ionosphere`/`raytrace` carry optional heavy
+deps and are gated behind extras.
 
-Planned (Phase 2, when the SuperDARN Doppler product lands): `carrier_tec`
-(carrier phase → dTEC) and `coherent` (slow-time range-Doppler FFT), extracted
-from hf-timestd and hf-tec respectively.
+### Extras
+
+```bash
+uv sync --extra dev                  # tests
+uv pip install -e '.[iono]'          # IRI ionosphere model (needs gfortran)
+uv pip install -e '.[raytrace]'      # PyLAP/PHaRLAP ray tracing (PHaRLAP staged separately)
+uv pip install -e '.[geomag]'        # apexpy geomagnetic coordinates
+```
+
+### Consumers / de-duplication status
+
+superdarn-sounder consumes `timing`, `geometry`, and `propagation`. The existing
+clients (hf-timestd, codar-sounder, hf-tec, wspr-recorder) still carry local
+copies of the extracted code (great-circle ×17 in hf-timestd, codar `invert`/
+`scintillation`, hf-tec `detect`/`coherent`); they are migrated onto this library
+**opportunistically** as each module is next touched.
 
 ## Development
 
