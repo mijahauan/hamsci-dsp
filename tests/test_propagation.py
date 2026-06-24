@@ -64,6 +64,7 @@ def test_dtec_linear_in_phase():
     assert np.std(r.dtec_rate_tecu_per_s) < 1e-9     # constant slope
     assert r.n_cycle_slips == 0 and r.n_gaps == 0
     assert r.unwrap_quality == 1.0
+    assert r.n_phase_jumps == 0
 
 
 def test_dtec_coasts_across_gap():

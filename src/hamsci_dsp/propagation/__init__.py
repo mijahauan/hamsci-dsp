@@ -18,8 +18,12 @@ from hamsci_dsp.propagation.oblique import (
     virtual_height_uncertainty_km,
 )
 from hamsci_dsp.propagation.scintillation import (
+    HF_OBLIQUE,
+    ITU_R_LBAND,
+    ScintillationConvention,
     ScintillationResult,
     compute_scintillation,
+    reclassify,
 )
 
 __all__ = [
@@ -29,4 +33,5 @@ __all__ = [
     "equivalent_vertical_freq_uncertainty_mhz", "oblique_muf_mhz",
     "obliquity_factor", "slant_to_vertical_tec", "group_delay_to_tec",
     "ScintillationResult", "compute_scintillation",
+    "ScintillationConvention", "ITU_R_LBAND", "HF_OBLIQUE", "reclassify",
 ]

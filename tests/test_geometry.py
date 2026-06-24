@@ -55,13 +55,27 @@ def test_elevation_angle_decreases_with_distance():
     assert 0.0 < far < near < 90.0
 
 
-def test_hop_geometry_inverts_codar_virtual_height():
-    # codar: h = sqrt(P^2 - D^2) / (2N).  hop_geometry must give back that P.
+def test_hop_geometry_spherical_path_inverts_via_height_from_path():
+    # Spherical law-of-cosines model: height_from_path must recover the height
+    # used to build the path (forward/inverse round-trip).
     D, h, N = 1500.0, 300.0, 1
     hg = G.hop_geometry(D, h, N)
-    h_back = math.sqrt(hg.path_length_km ** 2 - D ** 2) / (2 * N)
-    assert abs(h_back - h) < 1e-6
     assert hg.path_length_km > D
+    assert hg.height_km == h and hg.reflection_height_km == h
+    recovered = G.height_from_path(hg.path_length_km, D, N)
+    assert recovered is not None and abs(recovered - h) < 1e-6
+    # Multi-hop round-trip too.
+    hg4 = G.hop_geometry(6000.0, 280.0, 3)
+    assert abs(G.height_from_path(hg4.path_length_km, 6000.0, 3) - 280.0) < 1e-6
+
+
+def test_hop_geometry_geometric_delay_and_helpers():
+    hg = G.hop_geometry(2000.0, 300.0, 1)
+    # geometric delay = slant path / c (km per ms)
+    assert hg.geometric_delay_ms == pytest.approx(hg.path_length_km / 299.792458)
+    # feasibility helpers
+    assert G.n_hops_for_distance(1500.0, 300.0) == 1
+    assert G.n_hops_for_distance(G.max_single_hop_distance_km(300.0) * 2.5, 300.0) >= 3
 
 
 def test_maidenhead_roundtrip():

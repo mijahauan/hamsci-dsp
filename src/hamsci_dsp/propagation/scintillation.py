@@ -138,7 +138,7 @@ which is the opposite of what scintillation monitoring wants.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
@@ -186,6 +186,81 @@ INTENSITY_NULL_THRESHOLD = 1e-30
 # 3σ; Rayleigh-distributed real scintillation produces intensity tails
 # to ~3·median while bad-sweep leakage produces ~10×.
 MAD_REJECTION_K = 4.0
+
+
+@dataclass(frozen=True)
+class ScintillationConvention:
+    """A scintillation *methodology*, bound as one unit.
+
+    A severity threshold is meaningless without the detrend order and the
+    analysis-window length that produced the index it bins — the σ_φ thresholds
+    are calibrated to a specific (detrend_order, window_s) high-pass, and the S4
+    thresholds to a specific band's fading regime. All three travel together
+    here, so :func:`compute_scintillation` reads detrend order, window and
+    thresholds *from this object* and they can never be set independently.
+
+    Selecting a convention selects the coupled triple atomically; cross-band
+    comparison of a bare ``s4_index`` / ``sigma_phi_rad`` is only meaningful
+    once both sides' conventions are known (hence they are carried on the
+    result, and :func:`reclassify` lets a stored result be re-binned).
+    """
+    name: str                      # e.g. "HF-oblique-v0.6.3", "ITU-R-Lband-P531"
+    band: str                      # band the thresholds are calibrated for
+    detrend_order: int             # 1 or 2 — poly order removed before sigma_phi
+    window_s: float                # nominal segment length the thresholds assume
+    s4_weak_max: float             # S4 < this -> weak; < s4_moderate_max -> moderate
+    s4_moderate_max: float
+    sigma_phi_weak_max: float      # rad
+    sigma_phi_moderate_max: float  # rad
+    s4_event: float
+    sigma_phi_event_rad: float
+    min_samples: int               # statistical floor appropriate to window/cadence
+    calibration: str               # PROVENANCE: empirical:<dataset> | estimate | ITU-R
+    observable_note: str           # what the index physically *is* in this band
+
+
+#: L-band / GNSS diffractive convention — ITU-R Rec. P.531 canonical thresholds.
+#: Correct for a single near-vertical transionospheric ray with a near-zero
+#: intrinsic multipath floor; misclassifies the HF oblique Rayleigh-fading
+#: baseline as "strong" by construction (see :data:`HF_OBLIQUE`).
+ITU_R_LBAND = ScintillationConvention(
+    name="ITU-R-Lband-P531",
+    band="L-band ~1.2-1.6 GHz, single transionospheric ray",
+    detrend_order=1, window_s=60.0,
+    s4_weak_max=0.3, s4_moderate_max=0.6,
+    sigma_phi_weak_max=0.2, sigma_phi_moderate_max=0.5,
+    s4_event=0.3, sigma_phi_event_rad=0.2,
+    min_samples=DEFAULT_MIN_SAMPLES,
+    calibration="ITU-R Rec. P.531 (diffractive, narrowband single-mode)",
+    observable_note=(
+        "Near-pure diffractive scatter on one line of sight; intrinsic "
+        "multipath floor ~0. Comparable to GNSS scintillation indices."),
+)
+
+#: HF oblique multi-hop convention — the codar/hf-timestd default. Thresholds
+#: are empirically anchored to the 2026-05-21 SEAB quiet-day distribution +
+#: Kp-correlation (see module docstring); the moderate/strong edges await
+#: storm (Kp>=5) validation. Quadratic detrend tracks the curved slow-time
+#: phase of real F-region oblique paths.
+HF_OBLIQUE = ScintillationConvention(
+    name="HF-oblique-v0.6.3",
+    band="HF 3-30 MHz, oblique multi-hop",
+    detrend_order=2, window_s=60.0,
+    s4_weak_max=S4_WEAK_MAX, s4_moderate_max=S4_MODERATE_MAX,
+    sigma_phi_weak_max=SIGMA_PHI_WEAK_MAX, sigma_phi_moderate_max=SIGMA_PHI_MODERATE_MAX,
+    s4_event=S4_EVENT_THRESHOLD, sigma_phi_event_rad=SIGMA_PHI_EVENT_THRESHOLD,
+    min_samples=DEFAULT_MIN_SAMPLES,
+    calibration=(
+        "empirical:SEAB/13.45MHz/1416km 2026-05-21, Kp 1.0-3.0 quiet-day "
+        "distribution + Kp-correlation; weak/moderate edge = quiet p90; "
+        "moderate/strong (1.5,2.0) NOT yet storm-validated (awaiting Kp>=5)"),
+    observable_note=(
+        "Blends diffractive scatter with refractive focusing, O/X splitting "
+        "and multi-hop multipath. Rayleigh-fading baseline puts quiet-day S4 "
+        "~0.7-1.0 by construction; S4>1 is valid (focusing), not clipped. NOT "
+        "the L-band diffractive observable — do not compare absolute values to "
+        "GNSS at face value."),
+)
 
 
 @dataclass(frozen=True)
@@ -242,26 +317,31 @@ class ScintillationResult:
     sigma_phi_linear_rad: float
     sigma_phi_quadratic_rad: float
     sigma_phi_underfit_ratio: float
+    # ── self-describing convention (so a severity label is never naked) ──
+    convention: ScintillationConvention  # the (threshold, detrend, window) triple used
+    window_s: float                       # MEASURED window = n_samples / sample_rate_hz
+    window_ok: bool                       # measured window within [0.5, 2]x convention.window_s;
+                                          # False => the poly high-pass cutoff is off-convention
+                                          # and the thresholds may not apply
+    # ── intensity diagnostics (post outlier-rejection) ──
+    mean_intensity: float
+    intensity_variance: float
 
 
-def _s4_severity(s4_index: float) -> str:
-    if s4_index < S4_WEAK_MAX:
+def _severity(value: float, weak_max: float, moderate_max: float) -> str:
+    """Bin a non-negative index into weak/moderate/strong (strict-less-than)."""
+    if value < weak_max:
         return "weak"
-    if s4_index < S4_MODERATE_MAX:
-        return "moderate"
-    return "strong"
-
-
-def _sigma_phi_severity(sigma_phi_rad: float) -> str:
-    if sigma_phi_rad < SIGMA_PHI_WEAK_MAX:
-        return "weak"
-    if sigma_phi_rad < SIGMA_PHI_MODERATE_MAX:
+    if value < moderate_max:
         return "moderate"
     return "strong"
 
 
 def _unknown_result(
-    n_samples: int, n_outliers_rejected: int = 0,
+    convention: ScintillationConvention,
+    n_samples: int,
+    n_outliers_rejected: int = 0,
+    window_s: float = 0.0,
 ) -> ScintillationResult:
     return ScintillationResult(
         s4_index=0.0,
@@ -276,6 +356,11 @@ def _unknown_result(
         sigma_phi_linear_rad=0.0,
         sigma_phi_quadratic_rad=0.0,
         sigma_phi_underfit_ratio=1.0,
+        convention=convention,
+        window_s=window_s,
+        window_ok=False,
+        mean_intensity=0.0,
+        intensity_variance=0.0,
     )
 
 
@@ -283,7 +368,8 @@ def compute_scintillation(
     slow_time: np.ndarray,
     *,
     sample_rate_hz: float,
-    min_samples: int = DEFAULT_MIN_SAMPLES,
+    convention: ScintillationConvention = HF_OBLIQUE,
+    min_samples: Optional[int] = None,
     pre_rejected_mask: Optional[np.ndarray] = None,
 ) -> ScintillationResult:
     """Compute S4 + σ_φ from one propagation mode's complex slow-time vector.
@@ -314,8 +400,13 @@ def compute_scintillation(
     slow_time = np.asarray(slow_time)
     n_input = int(slow_time.size)
 
+    # The detrend order, window and thresholds all come from `convention` —
+    # they are calibrated together and must not be set independently.
+    if min_samples is None:
+        min_samples = convention.min_samples
+
     if n_input < min_samples:
-        return _unknown_result(n_input)
+        return _unknown_result(convention, n_input)
     if sample_rate_hz <= 0:
         raise ValueError(f"sample_rate_hz must be > 0; got {sample_rate_hz}")
 
@@ -393,7 +484,7 @@ def compute_scintillation(
     if n_samples < min_samples:
         # Report retained count, not the input count: ``n_samples`` is
         # documented as the post-rejection retained count.
-        return _unknown_result(n_samples, n_outliers_rejected)
+        return _unknown_result(convention, n_samples, n_outliers_rejected)
 
     slow_kept = slow_time[keep]
     intensity_kept = intensity[keep]
@@ -401,7 +492,7 @@ def compute_scintillation(
     mean_intensity = float(np.mean(intensity_kept))
     if mean_intensity < INTENSITY_NULL_THRESHOLD:
         # Range bin has effectively no signal — refuse to classify.
-        return _unknown_result(n_input, n_outliers_rejected)
+        return _unknown_result(convention, n_input, n_outliers_rejected)
 
     # ─── S4 ──────────────────────────────────────────────────────────
     # Population variance (ddof=0) matches the ITU-R conventional
@@ -454,9 +545,11 @@ def compute_scintillation(
 
     sigma_phi_quadratic_rad = float(np.std(phase_detrended_quad, ddof=0))
     sigma_phi_linear_rad = float(np.std(phase_detrended_lin, ddof=0))
-    # Canonical σ_φ value used for severity classification — matches
-    # the v0.5.2 behaviour (quadratic).
-    sigma_phi_rad = sigma_phi_quadratic_rad
+    # σ_φ feeding severity is selected BY the convention's detrend order. Both
+    # orders are computed regardless (the underfit ratio is a TID diagnostic and
+    # the retained pair lets `reclassify` switch detrend order without recompute).
+    sigma_phi_rad = (sigma_phi_linear_rad if convention.detrend_order == 1
+                     else sigma_phi_quadratic_rad)
 
     # Underfit ratio: ≥ 1 by construction (quadratic basis ⊇ linear
     # basis → quadratic residual ≤ linear residual).  When the
@@ -474,7 +567,7 @@ def compute_scintillation(
             and np.isfinite(mode_doppler_hz)
             and np.isfinite(sigma_phi_linear_rad)
             and np.isfinite(sigma_phi_underfit_ratio)):
-        return _unknown_result(n_input, n_outliers_rejected)
+        return _unknown_result(convention, n_input, n_outliers_rejected)
 
     # ─── Confidence ──────────────────────────────────────────────────
     # Pure sample-count saturation on the *retained* count; no CV-based
@@ -482,11 +575,20 @@ def compute_scintillation(
     # docstring).
     confidence = float(min(1.0, n_samples / CONFIDENCE_SAMPLE_SATURATION))
 
-    s4_severity = _s4_severity(s4_index)
-    sigma_phi_severity = _sigma_phi_severity(sigma_phi_rad)
+    # Measured window vs the convention's nominal window. The polynomial
+    # detrend is a high-pass with cutoff ~ order/window, so the thresholds are
+    # only valid near the window they were calibrated at; flag off-convention
+    # windows rather than silently trusting the bins.
+    window_s = n_samples / sample_rate_hz
+    window_ok = (0.5 * convention.window_s <= window_s <= 2.0 * convention.window_s)
+
+    s4_severity = _severity(s4_index, convention.s4_weak_max,
+                            convention.s4_moderate_max)
+    sigma_phi_severity = _severity(sigma_phi_rad, convention.sigma_phi_weak_max,
+                                   convention.sigma_phi_moderate_max)
     scintillation_event = (
-        s4_index >= S4_EVENT_THRESHOLD
-        or sigma_phi_rad >= SIGMA_PHI_EVENT_THRESHOLD
+        s4_index >= convention.s4_event
+        or sigma_phi_rad >= convention.sigma_phi_event_rad
     )
 
     return ScintillationResult(
@@ -502,4 +604,51 @@ def compute_scintillation(
         sigma_phi_linear_rad=sigma_phi_linear_rad,
         sigma_phi_quadratic_rad=sigma_phi_quadratic_rad,
         sigma_phi_underfit_ratio=sigma_phi_underfit_ratio,
+        convention=convention,
+        window_s=window_s,
+        window_ok=window_ok,
+        mean_intensity=mean_intensity,
+        intensity_variance=intensity_variance,
+    )
+
+
+def reclassify(
+    result: ScintillationResult, convention: ScintillationConvention,
+) -> ScintillationResult:
+    """Re-bin an existing result under a different convention, no raw samples.
+
+    Severity is a pure function of (raw index, convention), so a stored result
+    can be re-labelled after the fact — which is what makes the choice of
+    convention reversible. This is *exact* across the detrend axis: both the
+    linear and quadratic σ_φ are retained on the result, so switching
+    ``detrend_order`` just re-selects the stored value. S4 is detrend-
+    independent, so it is unchanged.
+
+    What it CANNOT do is fix a window mismatch — the polynomial high-pass cutoff
+    depends on the window the indices were computed at, which needs the raw
+    ``slow_time`` to change. ``window_ok`` is re-evaluated against the new
+    convention's nominal window so a mismatch stays visible. An ``"unknown"``
+    result re-classifies to ``"unknown"``.
+    """
+    if result.s4_severity == "unknown":
+        # Nothing to re-bin; just restamp the convention it's reported under.
+        return replace(result, convention=convention,
+                       window_ok=(0.5 * convention.window_s <= result.window_s
+                                  <= 2.0 * convention.window_s))
+
+    sigma_phi_rad = (result.sigma_phi_linear_rad if convention.detrend_order == 1
+                     else result.sigma_phi_quadratic_rad)
+    window_ok = (0.5 * convention.window_s <= result.window_s
+                 <= 2.0 * convention.window_s)
+    return replace(
+        result,
+        sigma_phi_rad=sigma_phi_rad,
+        s4_severity=_severity(result.s4_index, convention.s4_weak_max,
+                              convention.s4_moderate_max),
+        sigma_phi_severity=_severity(sigma_phi_rad, convention.sigma_phi_weak_max,
+                                     convention.sigma_phi_moderate_max),
+        scintillation_event=(result.s4_index >= convention.s4_event
+                             or sigma_phi_rad >= convention.sigma_phi_event_rad),
+        convention=convention,
+        window_ok=window_ok,
     )

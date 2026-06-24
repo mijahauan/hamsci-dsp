@@ -34,6 +34,8 @@ class CarrierDTEC:
     n_cycle_slips: int
     n_gaps: int
     unwrap_quality: float         # 0..1 risk score (1 = clean)
+    n_phase_jumps: int            # raw count of post-unwrap steps |Δφ|>π/2 (the
+                                  # numerator behind unwrap_quality)
     n_points: int
 
 
@@ -87,5 +89,6 @@ def dtec_from_phase(epochs, carrier_phase_rad, frequency_mhz: float):
         n_cycle_slips=n_cycle_slips,
         n_gaps=n_gaps,
         unwrap_quality=unwrap_quality,
+        n_phase_jumps=n_jumps,
         n_points=int(epochs.size),
     )

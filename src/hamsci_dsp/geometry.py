@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from geographiclib.geodesic import Geodesic
 
-from hamsci_dsp.constants import R_EARTH_KM
+from hamsci_dsp.constants import C_KM_MS, R_EARTH_KM
 
 _WGS84 = Geodesic.WGS84
 
@@ -53,18 +53,50 @@ def destination(lat: float, lon: float, bearing: float, distance_km: float
 # --------------------------------------------------------------------------
 # Reflection geometry (spherical Earth) — for oblique-incidence sounding
 # --------------------------------------------------------------------------
+#
+# One ionospheric hop is the triangle (Earth centre C, ground point G,
+# reflection point P): G on the surface at geocentric radius R, P at radius
+# r_p = R + h above the hop midpoint.  The hop's ground arc subtends a central
+# angle theta = d_hop/R; each leg (G->P) spans the half-hop angle gamma =
+# theta/2.  Law of cosines for one leg's slant range:
+#
+#     slant^2 = R^2 + r_p^2 - 2*R*r_p*cos(gamma)
+#
+# and the take-off elevation is atan2(r_p*cos(gamma) - R, r_p*sin(gamma)).
+# Both reduce to the flat-Earth triangle as gamma -> 0.  This spherical model
+# (the hf-timestd "single source of truth", review item S2) replaces the older
+# flat-segment approximation; for a 7000 km path the divergence is several
+# percent (tens of ms of group delay).  Davies, K. (1990) "Ionospheric Radio"
+# IEE EM Waves Series 31, §6.  The flat-segment codar virtual-height relation
+# (h = sqrt(P^2-D^2)/(2N)) lives separately in propagation.oblique.
+
 
 @dataclass(frozen=True)
 class HopGeometry:
-    n_hops: int
-    ground_distance_km: float
-    reflection_height_km: float
-    path_length_km: float          # total slant group path
-    elevation_deg: float           # take-off elevation above horizon
+    """Spherical-Earth geometry of an N-hop HF skywave path."""
+
+    n_hops: int                    # number of ionospheric reflections (>= 1)
+    ground_distance_km: float      # total great-circle ground distance
+    height_km: float               # reflection-layer height
+    path_length_km: float          # total slant path, all hops, up + down
+    elevation_deg: float           # launch / arrival elevation angle
+    slant_per_leg_km: float        # one up-or-down leg of a single hop
+    central_angle_rad: float       # full per-hop ground-arc central angle
+
+    @property
+    def reflection_height_km(self) -> float:
+        """Alias for :attr:`height_km` — the reflection-layer height (km)."""
+        return self.height_km
+
+    @property
+    def geometric_delay_ms(self) -> float:
+        """Vacuum (free-space) propagation delay over the slant path."""
+        return self.path_length_km / C_KM_MS
 
 
 def elevation_angle_deg(ground_distance_km: float, reflection_height_km: float,
-                        n_hops: int = 1) -> float:
+                        n_hops: int = 1,
+                        earth_radius_km: float = R_EARTH_KM) -> float:
     """Take-off elevation angle for an ``n_hops`` reflection at a given virtual
     height, on a spherical Earth.
 
@@ -74,30 +106,98 @@ def elevation_angle_deg(ground_distance_km: float, reflection_height_km: float,
     if n_hops < 1:
         raise ValueError(f"n_hops must be >= 1; got {n_hops}")
     d = ground_distance_km / n_hops
-    gamma = (d / 2.0) / R_EARTH_KM
-    rp = R_EARTH_KM + reflection_height_km
+    gamma = (d / 2.0) / earth_radius_km
+    rp = earth_radius_km + reflection_height_km
     return math.degrees(math.atan2(
-        math.cos(gamma) - R_EARTH_KM / rp, math.sin(gamma)))
+        math.cos(gamma) - earth_radius_km / rp, math.sin(gamma)))
+
+
+def max_single_hop_distance_km(height_km: float,
+                               earth_radius_km: float = R_EARTH_KM) -> float:
+    """Largest ground distance reachable in one hop (tangent-ray limit).
+
+    Twice the tangent-ray slant range ``sqrt(2*R*h + h^2)``; callers apply
+    their own feasibility margin.
+    """
+    return 2.0 * math.sqrt(2.0 * earth_radius_km * height_km + height_km ** 2)
+
+
+def n_hops_for_distance(ground_distance_km: float, height_km: float,
+                        earth_radius_km: float = R_EARTH_KM) -> int:
+    """Minimum number of hops needed to span ``ground_distance_km`` (always
+    ``>= 1``). The ground-wave (no-hop) case is left to the caller."""
+    max_1hop = max_single_hop_distance_km(height_km, earth_radius_km)
+    if ground_distance_km <= max_1hop:
+        return 1
+    return max(2, int(math.ceil(ground_distance_km / max_1hop)))
 
 
 def hop_geometry(ground_distance_km: float, reflection_height_km: float,
-                 n_hops: int = 1) -> HopGeometry:
-    """Slant group path + elevation for an ``n_hops`` mirror-model reflection.
+                 n_hops: int = 1,
+                 earth_radius_km: float = R_EARTH_KM) -> HopGeometry:
+    """Spherical-Earth law-of-cosines geometry of an N-hop skywave path.
 
-    Flat-segment slant per hop = ``2·sqrt((D/2N)² + h²)`` summed over N hops,
-    i.e. total ``P = sqrt(D² + (2 N h)²)`` — the inverse of the codar virtual-
-    height relation ``h = sqrt(P² - D²)/(2N)``.
+    Total slant path is ``N·2·slant`` with the per-leg slant from the law of
+    cosines above; the launch/arrival elevation comes from
+    :func:`elevation_angle_deg`.  Raises ``ValueError`` for ``n_hops < 1`` or
+    negative distances.
     """
-    path = math.sqrt(ground_distance_km ** 2
-                     + (2.0 * n_hops * reflection_height_km) ** 2)
+    if n_hops < 1:
+        raise ValueError(f"n_hops must be >= 1, got {n_hops}")
+    if ground_distance_km < 0 or reflection_height_km < 0:
+        raise ValueError(
+            f"distances must be non-negative "
+            f"(ground={ground_distance_km}, height={reflection_height_km})")
+
+    R = earth_radius_km
+    r_p = R + reflection_height_km
+    hop_ground_km = ground_distance_km / n_hops
+    theta = hop_ground_km / R              # per-hop ground-arc central angle
+    gamma = theta / 2.0                    # half-hop: ground point -> reflection
+
+    slant_sq = R ** 2 + r_p ** 2 - 2.0 * R * r_p * math.cos(gamma)
+    slant = math.sqrt(max(0.0, slant_sq))
+    path_length_km = n_hops * 2.0 * slant
+
     return HopGeometry(
         n_hops=n_hops,
         ground_distance_km=ground_distance_km,
-        reflection_height_km=reflection_height_km,
-        path_length_km=path,
+        height_km=reflection_height_km,
+        path_length_km=path_length_km,
         elevation_deg=elevation_angle_deg(ground_distance_km,
-                                          reflection_height_km, n_hops),
+                                          reflection_height_km, n_hops,
+                                          earth_radius_km),
+        slant_per_leg_km=slant,
+        central_angle_rad=theta,
     )
+
+
+def height_from_path(path_length_km: float, ground_distance_km: float,
+                     n_hops: int,
+                     earth_radius_km: float = R_EARTH_KM) -> Optional[float]:
+    """Inverse of :func:`hop_geometry`: reflection height from an observed path.
+
+    Solves the law-of-cosines leg equation for ``r_p`` (taking the physical
+    ``+`` root) and returns ``r_p - R``.  Returns ``None`` when the path is too
+    short to close the triangle for this ground distance and hop count
+    (discriminant < 0) or the implied height is negative.
+    """
+    if n_hops < 1 or path_length_km <= 0 or ground_distance_km < 0:
+        return None
+
+    R = earth_radius_km
+    slant = path_length_km / (2.0 * n_hops)
+    gamma = ground_distance_km / (2.0 * R * n_hops)
+
+    discriminant = slant ** 2 - (R * math.sin(gamma)) ** 2
+    if discriminant < 0:
+        return None
+
+    r_p = R * math.cos(gamma) + math.sqrt(discriminant)
+    height_km = r_p - R
+    if height_km < 0:
+        return None
+    return height_km
 
 
 # --------------------------------------------------------------------------
