@@ -59,5 +59,5 @@ uv run pytest
 
 ## Authors
 
-- Michael Hauan (AC0G) — https://github.com/mijahauan/hamsci-dsp
+- Michael Hauan (AC0G) — https://github.com/HamSCI/hamsci-dsp
 - Part of [HamSCI](https://hamsci.org/).
