@@ -84,6 +84,24 @@ def test_offset_not_usable_when_absent(tmp_path):
     assert not snap.offset_usable
 
 
+def test_negative_offset_handled(tmp_path):
+    # A behind-real-time radiod yields a negative RTP->UTC offset; it must
+    # round-trip with sign intact (clients add it to the anchor UTC).
+    p = _write(tmp_path, _fresh_payload(rtp_to_utc_offset_ns=-1_234_567))
+    snap = AuthorityReader(path=p, now_fn=lambda: _NOW).read()
+    assert snap is not None
+    assert snap.rtp_to_utc_offset_ns == -1_234_567
+    assert abs(snap.offset_seconds - (-0.001234567)) < 1e-12
+
+
+def test_governor_radiod_none_when_absent(tmp_path):
+    payload = _fresh_payload()
+    del payload["governor_radiod"]
+    snap = AuthorityReader(path=_write(tmp_path, payload), now_fn=lambda: _NOW).read()
+    assert snap is not None
+    assert snap.governor_radiod is None
+
+
 def test_standalone_block_shape_matches():
     block = standalone_timing_authority(client_radiod="fhe-rx888")
     assert block["source"] == "standalone-fallback"
