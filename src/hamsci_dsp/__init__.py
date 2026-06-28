@@ -7,7 +7,10 @@ contract surface — pinned by each consumer via
 
 Modules:
   timing  — AuthorityReader / AuthoritySnapshot: the consumer side of
-            hf-timestd's /run/hf-timestd/authority.json (RTP↔UTC offset).
+            hf-timestd's /run/hf-timestd/authority.json (RTP↔UTC offset);
+            acquire_anchor_utc: the one shared RTP->UTC anchor every
+            recorder pins at stream start (RTP timestamp + authority offset).
+            Epoch-aligned slot *boundaries* live in ka9q.SlotClock, not here.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

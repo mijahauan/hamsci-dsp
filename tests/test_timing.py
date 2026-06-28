@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 
 from hamsci_dsp.timing import (
     AuthorityReader,
+    AuthoritySnapshot,
+    acquire_anchor_utc,
     standalone_timing_authority,
 )
 
@@ -100,6 +102,118 @@ def test_governor_radiod_none_when_absent(tmp_path):
     snap = AuthorityReader(path=_write(tmp_path, payload), now_fn=lambda: _NOW).read()
     assert snap is not None
     assert snap.governor_radiod is None
+
+
+# ── acquire_anchor_utc ────────────────────────────────────────────────────
+
+class _Snap:
+    """Minimal AuthoritySnapshot stand-in (offset usable)."""
+    def __init__(self, offset_ns=2_000_000):
+        self.rtp_to_utc_offset_ns = offset_ns
+        self.t_level_active = "T3"
+
+    @property
+    def offset_usable(self):
+        return self.t_level_active is not None and self.rtp_to_utc_offset_ns is not None
+
+    @property
+    def offset_seconds(self):
+        return (self.rtp_to_utc_offset_ns or 0) / 1e9
+
+
+def _rtp_to_utc_ok(rtp, ci, wallclock_hint_sec=None):
+    # Pretend radiod's RTP maps to a fixed GPS-true instant.
+    return 1_700_000_000.0
+
+
+def _rtp_to_utc_none(rtp, ci, wallclock_hint_sec=None):
+    return None
+
+
+def test_anchor_rtp_referenced_with_authority():
+    a = acquire_anchor_utc(
+        first_rtp=12345, channel_info=object(), rtp_to_utc=_rtp_to_utc_ok,
+        snapshot=_Snap(offset_ns=2_000_000),  # +2 ms
+    )
+    assert a.rtp_referenced
+    assert a.source == "rtp_to_utc+authority"
+    assert abs(a.utc - (1_700_000_000.0 + 0.002)) < 1e-9
+    assert a.offset_ns == 2_000_000
+
+
+def test_anchor_rtp_referenced_no_authority():
+    a = acquire_anchor_utc(
+        first_rtp=12345, channel_info=object(), rtp_to_utc=_rtp_to_utc_ok,
+        snapshot=None,
+    )
+    assert a.rtp_referenced
+    assert a.source == "rtp_to_utc"
+    assert a.utc == 1_700_000_000.0
+    assert a.offset_seconds == 0.0
+
+
+def test_anchor_falls_back_when_no_channel_info():
+    # samples_behind names the first held sample, not "now".
+    a = acquire_anchor_utc(
+        first_rtp=None, channel_info=None, rtp_to_utc=_rtp_to_utc_ok,
+        snapshot=None, samples_behind=2400, sample_rate=12000,
+        now_fn=lambda: 1_700_000_500.0,
+    )
+    assert not a.rtp_referenced
+    assert a.source == "wallclock_fallback"
+    assert abs(a.utc - (1_700_000_500.0 - 0.2)) < 1e-9
+
+
+def test_anchor_fallback_applies_authority_offset():
+    a = acquire_anchor_utc(
+        first_rtp=None, channel_info=None, rtp_to_utc=_rtp_to_utc_ok,
+        snapshot=_Snap(offset_ns=5_000_000), now_fn=lambda: 1_700_000_500.0,
+    )
+    assert not a.rtp_referenced
+    assert a.source == "authority_on_wallclock"
+    assert abs(a.utc - (1_700_000_500.0 + 0.005)) < 1e-9
+
+
+def test_anchor_falls_back_when_rtp_to_utc_returns_none():
+    a = acquire_anchor_utc(
+        first_rtp=12345, channel_info=object(), rtp_to_utc=_rtp_to_utc_none,
+        snapshot=None, now_fn=lambda: 1_700_000_500.0,
+    )
+    assert not a.rtp_referenced
+    assert a.source == "wallclock_fallback"
+    assert a.utc == 1_700_000_500.0
+
+
+def test_anchor_reads_injected_authority_reader():
+    class _Reader:
+        def read(self):
+            return _Snap(offset_ns=1_000_000)
+    a = acquire_anchor_utc(
+        first_rtp=1, channel_info=object(), rtp_to_utc=_rtp_to_utc_ok,
+        authority_reader=_Reader(),
+    )
+    assert a.source == "rtp_to_utc+authority"
+    assert a.snapshot is not None
+
+
+def test_anchor_survives_authority_reader_exception():
+    class _BadReader:
+        def read(self):
+            raise RuntimeError("boom")
+    a = acquire_anchor_utc(
+        first_rtp=1, channel_info=object(), rtp_to_utc=_rtp_to_utc_ok,
+        authority_reader=_BadReader(),
+    )
+    # Degrades to no-authority RTP path, never raises.
+    assert a.rtp_referenced and a.source == "rtp_to_utc"
+
+
+def test_anchor_datetime_property():
+    a = acquire_anchor_utc(
+        first_rtp=1, channel_info=object(), rtp_to_utc=_rtp_to_utc_ok, snapshot=None,
+    )
+    assert a.datetime.tzinfo is timezone.utc
+    assert abs(a.datetime.timestamp() - 1_700_000_000.0) < 1e-6
 
 
 def test_standalone_block_shape_matches():

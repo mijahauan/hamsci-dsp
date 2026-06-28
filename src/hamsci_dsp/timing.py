@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,6 +184,113 @@ def standalone_timing_authority(
         "client_radiod": client_radiod,
         "authority_utc_published": None,
     }
+
+
+@dataclass(frozen=True)
+class AnchorUTC:
+    """Result of :func:`acquire_anchor_utc` — the single RTP->UTC anchor a
+    sigmond recorder pins once at stream start.
+
+    utc             epoch seconds of the anchored RTP sample
+    source          provenance of the value (see acquire_anchor_utc)
+    offset_seconds  authority RTP->UTC offset applied (0.0 if none usable)
+    offset_ns       raw published offset in ns (None if no usable authority)
+    snapshot        the AuthoritySnapshot consulted (None if unavailable)
+    rtp_referenced  True iff utc came from rtp_to_utc, not a wall-clock fallback
+    """
+    utc: float
+    source: str
+    offset_seconds: float
+    offset_ns: Optional[int]
+    snapshot: Optional[AuthoritySnapshot]
+    rtp_referenced: bool
+
+    @property
+    def datetime(self) -> datetime:
+        """The anchor as a tz-aware UTC datetime (codar/hf-tec/wspr want this)."""
+        return datetime.fromtimestamp(self.utc, tz=timezone.utc)
+
+
+def acquire_anchor_utc(
+    first_rtp: Optional[int],
+    channel_info,
+    rtp_to_utc: Callable,
+    *,
+    authority_reader=None,
+    snapshot: Optional[AuthoritySnapshot] = None,
+    samples_behind: int = 0,
+    sample_rate: int = 12000,
+    now_fn: Callable[[], float] = time.time,
+) -> AnchorUTC:
+    """Pin one RTP timestamp to UTC — the canonical anchor every sigmond
+    slot/frame recorder establishes once at stream start.
+
+    Replaces the five hand-rolled ``_compute_anchor_utc`` /
+    ``_anchor_utc_for`` / ``_acquire_reference_utc`` copies that had drifted
+    apart (e.g. hf-tec compensated for dropped samples in its fallback while
+    codar did not).  One implementation so an upstream timing fix lands once.
+
+    Preferred path (``rtp_referenced=True``): ``rtp_to_utc(first_rtp,
+    channel_info, wallclock_hint_sec=now+offset)`` plus the hf-timestd §18
+    authority offset.  radiod's GPSDO-disciplined RTP counter is the time
+    reference; the host clock is used only as a wrap-disambiguation hint
+    (±period/2, hours-scale).  This is the METROLOGY §4.5 RTP-reference
+    invariant.
+
+    Fallback (``rtp_referenced=False``), when no RTP timestamp / channel_info
+    is available or ``rtp_to_utc`` returns None: the host wall clock at
+    ``now_fn()`` minus ``samples_behind/sample_rate`` — so the anchor names the
+    FIRST sample the caller holds, not "now" — plus the authority offset if one
+    is usable.
+
+    ``rtp_to_utc`` is injected (pass ``ka9q.rtp_to_utc``; the deprecated
+    ``rtp_to_wallclock`` alias works too) so this module keeps no ka9q
+    dependency.  Provide either ``authority_reader`` (read here) or a pre-read
+    ``snapshot``.
+
+    ``source`` ∈ {``"rtp_to_utc+authority"``, ``"rtp_to_utc"``,
+    ``"authority_on_wallclock"``, ``"wallclock_fallback"``}.
+    """
+    if snapshot is None and authority_reader is not None:
+        try:
+            snapshot = authority_reader.read()
+        except Exception as exc:  # noqa: BLE001 — never crash the audio path
+            logger.warning("authority read failed at anchor: %s", exc)
+            snapshot = None
+    usable = snapshot is not None and snapshot.offset_usable
+    offset_sec = snapshot.offset_seconds if usable else 0.0
+    offset_ns = snapshot.rtp_to_utc_offset_ns if usable else None
+
+    if first_rtp is not None and channel_info is not None:
+        try:
+            utc_sec = rtp_to_utc(
+                int(first_rtp) & 0xFFFFFFFF,
+                channel_info,
+                wallclock_hint_sec=now_fn() + offset_sec,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("rtp_to_utc raised at anchor: %s", exc)
+            utc_sec = None
+        if utc_sec is not None:
+            return AnchorUTC(
+                utc=utc_sec + offset_sec,
+                source="rtp_to_utc+authority" if usable else "rtp_to_utc",
+                offset_seconds=offset_sec,
+                offset_ns=offset_ns,
+                snapshot=snapshot,
+                rtp_referenced=True,
+            )
+
+    # Wall-clock fallback: name the FIRST held sample, apply the offset if any.
+    utc = now_fn() - samples_behind / sample_rate + offset_sec
+    return AnchorUTC(
+        utc=utc,
+        source="authority_on_wallclock" if usable else "wallclock_fallback",
+        offset_seconds=offset_sec,
+        offset_ns=offset_ns,
+        snapshot=snapshot,
+        rtp_referenced=False,
+    )
 
 
 def _parse_iso_z(s: str) -> datetime:
