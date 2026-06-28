@@ -220,7 +220,7 @@ def acquire_anchor_utc(
     snapshot: Optional[AuthoritySnapshot] = None,
     samples_behind: int = 0,
     sample_rate: int = 12000,
-    now_fn: Callable[[], float] = time.time,
+    now_fn: Optional[Callable[[], float]] = None,
 ) -> AnchorUTC:
     """Pin one RTP timestamp to UTC — the canonical anchor every sigmond
     slot/frame recorder establishes once at stream start.
@@ -251,6 +251,10 @@ def acquire_anchor_utc(
     ``source`` ∈ {``"rtp_to_utc+authority"``, ``"rtp_to_utc"``,
     ``"authority_on_wallclock"``, ``"wallclock_fallback"``}.
     """
+    # Resolve at call time (not as a default arg) so ``time.time`` stays
+    # patchable and an explicit now_fn still wins.
+    if now_fn is None:
+        now_fn = time.time
     if snapshot is None and authority_reader is not None:
         try:
             snapshot = authority_reader.read()
